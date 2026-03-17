@@ -1,0 +1,4 @@
+opencv-python
+ultralytics
+mediapipe
+protobuf==3.20.3

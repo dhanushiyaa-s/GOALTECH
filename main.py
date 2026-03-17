@@ -1,83 +1,156 @@
 import cv2
+import time
+from collections import deque
 
-from face_module.face import load_known_faces, recognize_faces
-from behaviour_module.behaviour import classify
+# Vision
+from vision.yolo_detector import YOLODetector
+from vision.face_analyzer import FaceAnalyzer
 
-# KEEP THESE IMPORTS SAME (your files)
-from attention_module.attention import get_attention
-from behaviour_module.detect import detect_phone
+# Logic
+from logic.temporal import stable
+from logic.behaviour import compute_score, classify_behavior
 
+# Analytics
+from analytics.tracker import Tracker
 
-# -------------------------------
-# LOAD FACES (dummy here)
-# -------------------------------
-known_face_encodings, known_face_names = load_known_faces()
+# ==============================
+# SETTINGS
+# ==============================
+STUDENT_NAME = "John Doe"
 
-# -------------------------------
-# START CAMERA
-# -------------------------------
+FRAME_SKIP = 2
+TALKING_THRESHOLD = 6
+SILENT_THRESHOLD = 20
+EYE_CLOSE_TIME = 10
+
+# ==============================
+# INIT
+# ==============================
+detector = YOLODetector("yolov8m.pt")
+face_analyzer = FaceAnalyzer()
+tracker = Tracker()
+
 cap = cv2.VideoCapture(0)
+cap.set(3, 1280)
+cap.set(4, 720)
 
-if not cap.isOpened():
-    print("Camera not working ❌")
-    exit()
+history = deque(maxlen=15)
 
-print("System Started ✅ Press 'q' to quit")
+frame_count = 0
+talking_frames = 0
+silent_frames = 0
+eye_closed_start = None
+last_phone_state = False
 
-# -------------------------------
-# LOOP
-# -------------------------------
-while True:
+# ==============================
+# MAIN LOOP
+# ==============================
+while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
-    # -------------------------------
-    # MODULE CALLS
-    # -------------------------------
-    face_locations, names = recognize_faces(frame)
+    frame_count += 1
+    h, w, _ = frame.shape
 
-    # ⚠️ SAFE CALLS (in case your functions differ)
-    try:
-        attention_score = get_attention(frame)
-    except:
-        attention_score = 1.0  # fallback
+    phone = False
+    talking = False
+    eyes_closed = False
+    gaze = "CENTER"
 
-    try:
-        phone_detected = detect_phone(frame)
-    except:
-        phone_detected = False
+    # ==============================
+    # FACE ANALYSIS
+    # ==============================
+    res = face_analyzer.analyze(frame)
 
-    # -------------------------------
+    if res.multi_face_landmarks:
+        for lm in res.multi_face_landmarks:
+
+            gaze = face_analyzer.get_eye_gaze(lm, w)
+            lip, eye = face_analyzer.detect_face_states(lm, h)
+
+            # Talking
+            if lip > 8:
+                talking_frames += 1
+                silent_frames = 0
+            else:
+                silent_frames += 1
+                talking_frames = 0
+
+            talking = talking_frames > TALKING_THRESHOLD
+            silent = silent_frames > SILENT_THRESHOLD
+
+            # Eyes
+            if eye < 3:
+                if eye_closed_start is None:
+                    eye_closed_start = time.time()
+            else:
+                eye_closed_start = None
+
+            if eye_closed_start and time.time() - eye_closed_start > EYE_CLOSE_TIME:
+                eyes_closed = True
+
+    # ==============================
+    # YOLO (PHONE DETECTION)
+    # ==============================
+    if frame_count % FRAME_SKIP == 0:
+        phone, persons, phones = detector.detect(frame)
+    else:
+        phone = last_phone_state
+
+    last_phone_state = phone
+
+    # ==============================
+    # TEMPORAL SMOOTHING
+    # ==============================
+    history.append({
+        "phone": phone,
+        "talking": talking,
+        "eyes": eyes_closed,
+        "gaze": gaze == "CENTER"
+    })
+
+    s_phone = stable(history, "phone")
+    s_talk = stable(history, "talking")
+    s_eye = stable(history, "eyes")
+    s_gaze = stable(history, "gaze")
+
+    # ==============================
+    # ANALYTICS
+    # ==============================
+    tracker.update_phone(s_phone)
+
+    score = compute_score(s_phone, s_eye, s_talk, s_gaze)
+    tracker.update_attention(score)
+
+    # ==============================
+    # BEHAVIOR
+    # ==============================
+    behavior = classify_behavior(s_eye, s_phone, s_talk, silent, s_gaze)
+
+    # ==============================
     # DISPLAY
-    # -------------------------------
-    for (top, right, bottom, left), name in zip(face_locations, names):
+    # ==============================
+    cv2.putText(frame, f"{STUDENT_NAME}", (20, 30), 0, 0.7, (0, 0, 0), 2)
+    cv2.putText(frame, f"Behavior: {behavior}", (20, 60), 0, 0.7, (0, 0, 255), 2)
+    cv2.putText(frame, f"Score: {score}%", (20, 90), 0, 0.7, (255, 0, 0), 2)
+    cv2.putText(frame, f"Gaze: {gaze}", (20, 120), 0, 0.6, (0, 0, 0), 1)
 
-        status = classify(attention_score, phone_detected)
+    cv2.imshow("AI Behavior Monitoring", frame)
 
-        # Color coding
-        color = (0, 255, 0)
-
-        if status == "Using Phone":
-            color = (0, 0, 255)
-        elif status == "Not Attentive":
-            color = (0, 165, 255)
-
-        # Draw box
-        cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-
-        # Label
-        label = f"{name} - {status}"
-        cv2.putText(frame, label, (left, top - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        print(label)
-
-    # Show frame
-    cv2.imshow("Smart Classroom Monitoring", frame)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if cv2.waitKey(1) & 0xFF == 27:
         break
+
+# ==============================
+# FINAL REPORT
+# ==============================
+report = tracker.report(STUDENT_NAME)
+
+print("\n===== FINAL REPORT =====")
+print(f"Student Name      : {report['name']}")
+print(f"Phone Usage       : {report['phone_time']} sec")
+print(f"Attention %       : {report['attention']:.2f}%")
+print("========================")
 
 cap.release()
 cv2.destroyAllWindows()
